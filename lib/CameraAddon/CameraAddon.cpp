@@ -1,5 +1,10 @@
 #include "CameraAddon.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "img_converters.h"
 #include "sdkconfig.h"
@@ -10,6 +15,12 @@
 #endif
 
 #include <cstring>
+#include <cstdint>
+
+/* 1 = log por frame no /stream (muito CPU; deixa o LCD irregular). */
+#ifndef CAMERAADDON_MJPEG_TRACE
+#define CAMERAADDON_MJPEG_TRACE 0
+#endif
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *kStreamContentType = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -24,7 +35,23 @@ CameraAddon *CameraAddon::s_instance_ = nullptr;
 
 CameraAddon::CameraAddon()
     : stream_httpd_(nullptr),
+      stream_min_period_ms_(0),
       capture_cb_(nullptr),
+      frame_service_started_(false),
+      run_capture_worker_(false),
+      capture_task_handle_(nullptr),
+      latest_jpeg_mutex_(nullptr),
+      latest_jpeg_buf_(nullptr),
+      stream_tx_buf_(nullptr),
+      latest_jpeg_cap_(0),
+      latest_jpeg_len_(0),
+      latest_sequence_(0),
+      mjpeg_next_deadline_us_(0),
+      stream_max_fps_(15),
+      aux_deliver_period_ms_(1000),
+      last_aux_deliver_ms_(0),
+      aux_jpeg_sink_(nullptr),
+      aux_jpeg_sink_ctx_(nullptr),
       pending_fb_(nullptr),
       pending_alloc_(nullptr),
       quality_user_set_(false),
@@ -61,6 +88,7 @@ CameraAddon::CameraAddon()
 #endif
       ra_filter_{} {
   memset(&ra_filter_, 0, sizeof(ra_filter_));
+  memset(&latest_timestamp_, 0, sizeof(latest_timestamp_));
 }
 
 CameraAddon::~CameraAddon() {
@@ -68,6 +96,7 @@ CameraAddon::~CameraAddon() {
     httpd_stop(stream_httpd_);
     stream_httpd_ = nullptr;
   }
+  stopFrameService();
   if (s_instance_ == this) {
     s_instance_ = nullptr;
   }
@@ -534,13 +563,20 @@ bool CameraAddon::setLedIntensity(int val) {
 
 CameraFrame CameraAddon::capture() {
   CameraFrame out{};
+  if (frame_service_started_) {
+    log_w("capture() ignorado: serviço de frame único ativo (copyLatestJpeg / setAuxJpegSink).");
+    return out;
+  }
   if (pending_fb_ || pending_alloc_) {
     return out;
   }
 
 #if defined(LED_GPIO_NUM)
   enableLed(true);
-  vTaskDelay(150 / portTICK_PERIOD_MS);
+  /* Só espera exposição com flash quando o LED está realmente aceso (evita 150 ms por frame no LCD). */
+  if (led_duty_ > 0) {
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
 #endif
 
   camera_fb_t *fb = esp_camera_fb_get();
@@ -597,6 +633,9 @@ void CameraAddon::onCapture(void (*callback)(uint8_t *buf, size_t len)) {
 }
 
 bool CameraAddon::captureAndNotify() {
+  if (frame_service_started_) {
+    return false;
+  }
   if (!capture_cb_) {
     return false;
   }
@@ -614,7 +653,21 @@ String CameraAddon::getStreamURL() const {
 
 void CameraAddon::setupLedFlash() {
 #if defined(LED_GPIO_NUM)
-  ledcAttach(LED_GPIO_NUM, 5000, 8);
+  #if defined(ARDUINO_ARCH_ESP32)
+
+    // ESP32 clássico (AI Thinker, etc.)
+    const int ledChannel = 7;
+    const int freq = 5000;
+    const int resolution = 8;
+
+    ledcSetup(ledChannel, freq, resolution);
+    ledcAttachPin(LED_GPIO_NUM, ledChannel);
+
+  #else
+    // ESP32-S3 / APIs novas
+    ledcAttach(LED_GPIO_NUM, 5000, 8);
+  #endif
+
 #else
   log_i("LED flash is disabled -> LED_GPIO_NUM undefined");
 #endif
@@ -665,6 +718,10 @@ esp_err_t CameraAddon::streamHandlerThunk(httpd_req_t *req) {
 }
 
 esp_err_t CameraAddon::streamHandler(httpd_req_t *req) {
+  if (frame_service_started_) {
+    return streamMjpegFromSharedLatest(req);
+  }
+
   camera_fb_t *fb = nullptr;
   struct timeval timestamp {};
   esp_err_t res = ESP_OK;
@@ -691,6 +748,8 @@ esp_err_t CameraAddon::streamHandler(httpd_req_t *req) {
 #endif
 
   while (true) {
+    res = ESP_OK;
+    const int64_t loop_start_us = esp_timer_get_time();
     jpg_buf = nullptr;
     jpg_buf_len = 0;
     fb = esp_camera_fb_get();
@@ -742,10 +801,31 @@ esp_err_t CameraAddon::streamHandler(httpd_req_t *req) {
 
     frame_time /= 1000;
     uint32_t avg_frame_time = (uint32_t)raFilterRun(&ra_filter_, (int)frame_time);
-    log_i(
-      "MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)", (uint32_t)(jpg_buf_len), (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time, avg_frame_time,
-      1000.0 / avg_frame_time
-    );
+
+    float fps = frame_time > 0 ? 1000.0f / frame_time : 0;
+    float avg_fps = avg_frame_time > 0 ? 1000.0f / avg_frame_time : 0;
+#if CAMERAADDON_MJPEG_TRACE
+    log_i("MJPG: %uB %ums (%.1ffps), AVG: %ums (%.1ffps)",
+      (uint32_t)jpg_buf_len,
+      (uint32_t)frame_time,
+      fps,
+      avg_frame_time,
+      avg_fps);
+#else
+    (void)fps;
+    (void)avg_fps;
+#endif
+
+    if (stream_min_period_ms_ > 0) {
+      const int64_t min_us = (int64_t)stream_min_period_ms_ * 1000;
+      const int64_t elapsed = esp_timer_get_time() - loop_start_us;
+      if (elapsed < min_us) {
+        const uint32_t wait_ms = (uint32_t)((min_us - elapsed + 999) / 1000);
+        if (wait_ms > 0) {
+          vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        }
+      }
+    }
   }
 
 #if defined(LED_GPIO_NUM)
@@ -776,13 +856,14 @@ bool CameraAddon::startStream() {
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 81;
+  config.stack_size = 12288;
+  config.ctrl_port = 32769;
+  config.max_open_sockets = 4;
 
   if (httpd_start(&stream_httpd_, &config) != ESP_OK) {
     log_e("Stream httpd start failed");
     stream_httpd_ = nullptr;
-    if (s_instance_ == this) {
-      s_instance_ = nullptr;
-    }
+    s_instance_ = nullptr;
     return false;
   }
 
@@ -795,12 +876,313 @@ bool CameraAddon::startStream() {
   if (httpd_register_uri_handler(stream_httpd_, &stream_uri) != ESP_OK) {
     httpd_stop(stream_httpd_);
     stream_httpd_ = nullptr;
-    if (s_instance_ == this) {
-      s_instance_ = nullptr;
-    }
+    s_instance_ = nullptr;
     return false;
   }
 
   log_i("Stream server on port 81");
   return true;
+}
+
+namespace {
+constexpr size_t kMaxJpegBufferBytes = 384 * 1024;
+}
+
+void CameraAddon::captureWorkerThunk(void *arg) {
+  static_cast<CameraAddon *>(arg)->captureWorkerLoop();
+}
+
+void CameraAddon::captureWorkerLoop() {
+  const TickType_t period_ticks = pdMS_TO_TICKS(67);
+  TickType_t last_wake = xTaskGetTickCount();
+  while (run_capture_worker_) {
+    vTaskDelayUntil(&last_wake, period_ticks);
+    if (!camera_ready_) {
+      continue;
+    }
+
+#if defined(LED_GPIO_NUM)
+    enableLed(true);
+    if (led_duty_ > 0) {
+      vTaskDelay(pdMS_TO_TICKS(150));
+    }
+#endif
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+#if defined(LED_GPIO_NUM)
+    enableLed(false);
+#endif
+
+    if (!fb) {
+      continue;
+    }
+    if (fb->format != PIXFORMAT_JPEG) {
+      esp_camera_fb_return(fb);
+      continue;
+    }
+    if (fb->len == 0 || fb->len > latest_jpeg_cap_) {
+      log_e("JPEG demasiado grande: %u > %u", (unsigned)fb->len, (unsigned)latest_jpeg_cap_);
+      esp_camera_fb_return(fb);
+      continue;
+    }
+
+    const size_t jpeg_len = fb->len;
+    if (xSemaphoreTake(latest_jpeg_mutex_, pdMS_TO_TICKS(200)) != pdTRUE) {
+      esp_camera_fb_return(fb);
+      continue;
+    }
+    memcpy(latest_jpeg_buf_, fb->buf, jpeg_len);
+    latest_jpeg_len_ = jpeg_len;
+    latest_timestamp_ = fb->timestamp;
+    ++latest_sequence_;
+    xSemaphoreGive(latest_jpeg_mutex_);
+    esp_camera_fb_return(fb);
+
+    void (*sink)(const uint8_t *, size_t, void *) = aux_jpeg_sink_;
+    if (sink && aux_deliver_period_ms_ > 0) {
+      const uint32_t now_ms = millis();
+      if (now_ms - last_aux_deliver_ms_ >= aux_deliver_period_ms_) {
+        last_aux_deliver_ms_ = now_ms;
+        uint8_t *dup = static_cast<uint8_t *>(malloc(jpeg_len));
+        if (!dup) {
+          continue;
+        }
+        if (xSemaphoreTake(latest_jpeg_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+          memcpy(dup, latest_jpeg_buf_, jpeg_len);
+          xSemaphoreGive(latest_jpeg_mutex_);
+          sink(dup, jpeg_len, aux_jpeg_sink_ctx_);
+        }
+        free(dup);
+      }
+    }
+  }
+
+  capture_task_handle_ = nullptr;
+  vTaskDelete(nullptr);
+}
+
+bool CameraAddon::startFrameService(uint32_t stack_words, UBaseType_t priority) {
+  if (!camera_ready_) {
+    log_e("startFrameService: chame initCamera() primeiro.");
+    return false;
+  }
+  if (frame_service_started_) {
+    return true;
+  }
+
+  latest_jpeg_mutex_ = xSemaphoreCreateMutex();
+  if (!latest_jpeg_mutex_) {
+    return false;
+  }
+
+  latest_jpeg_cap_ = kMaxJpegBufferBytes;
+  const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  latest_jpeg_buf_ = static_cast<uint8_t *>(heap_caps_malloc(latest_jpeg_cap_, caps));
+  if (!latest_jpeg_buf_) {
+    latest_jpeg_buf_ = static_cast<uint8_t *>(malloc(latest_jpeg_cap_));
+  }
+  stream_tx_buf_ = static_cast<uint8_t *>(heap_caps_malloc(latest_jpeg_cap_, caps));
+  if (!stream_tx_buf_) {
+    stream_tx_buf_ = static_cast<uint8_t *>(malloc(latest_jpeg_cap_));
+  }
+  if (!latest_jpeg_buf_ || !stream_tx_buf_) {
+    free(latest_jpeg_buf_);
+    free(stream_tx_buf_);
+    latest_jpeg_buf_ = nullptr;
+    stream_tx_buf_ = nullptr;
+    vSemaphoreDelete(latest_jpeg_mutex_);
+    latest_jpeg_mutex_ = nullptr;
+    return false;
+  }
+
+  latest_jpeg_len_ = 0;
+  latest_sequence_ = 0;
+  last_aux_deliver_ms_ = millis();
+  run_capture_worker_ = true;
+
+  if (xTaskCreatePinnedToCore(captureWorkerThunk, "camFrame", stack_words, this, priority, &capture_task_handle_,
+                              1) != pdPASS) {
+    run_capture_worker_ = false;
+    free(latest_jpeg_buf_);
+    free(stream_tx_buf_);
+    latest_jpeg_buf_ = nullptr;
+    stream_tx_buf_ = nullptr;
+    vSemaphoreDelete(latest_jpeg_mutex_);
+    latest_jpeg_mutex_ = nullptr;
+    return false;
+  }
+
+  frame_service_started_ = true;
+  log_i("Serviço de frame único ativo (captura ~15 Hz, core 1).");
+  return true;
+}
+
+void CameraAddon::stopFrameService() {
+  run_capture_worker_ = false;
+  for (int i = 0; i < 200 && capture_task_handle_ != nullptr; ++i) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  capture_task_handle_ = nullptr;
+
+  if (latest_jpeg_mutex_) {
+    vSemaphoreDelete(latest_jpeg_mutex_);
+    latest_jpeg_mutex_ = nullptr;
+  }
+  free(latest_jpeg_buf_);
+  free(stream_tx_buf_);
+  latest_jpeg_buf_ = nullptr;
+  stream_tx_buf_ = nullptr;
+  latest_jpeg_len_ = 0;
+  latest_jpeg_cap_ = 0;
+  frame_service_started_ = false;
+}
+
+void CameraAddon::setStreamMaxFps(uint8_t fps) {
+  if (fps < 1) {
+    fps = 1;
+  }
+  if (fps > 15) {
+    fps = 15;
+  }
+  stream_max_fps_ = fps;
+}
+
+void CameraAddon::setAuxJpegDeliverPeriodMs(uint32_t ms) {
+  aux_deliver_period_ms_ = ms ? ms : 1;
+}
+
+void CameraAddon::setAuxJpegSink(void (*sink)(const uint8_t *jpeg, size_t len, void *ctx), void *ctx) {
+  aux_jpeg_sink_ = sink;
+  aux_jpeg_sink_ctx_ = ctx;
+}
+
+bool CameraAddon::copyLatestJpeg(uint8_t *dst, size_t dst_cap, size_t *out_len, struct timeval *timestamp_out,
+                                  uint32_t timeout_ms) {
+  if (!frame_service_started_ || !latest_jpeg_mutex_ || !dst || !out_len) {
+    return false;
+  }
+  const TickType_t wait_ticks =
+      (timeout_ms == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+  if (xSemaphoreTake(latest_jpeg_mutex_, wait_ticks) != pdTRUE) {
+    return false;
+  }
+  const bool ok = latest_jpeg_len_ > 0 && latest_jpeg_len_ <= dst_cap;
+  if (ok) {
+    memcpy(dst, latest_jpeg_buf_, latest_jpeg_len_);
+    *out_len = latest_jpeg_len_;
+    if (timestamp_out) {
+      *timestamp_out = latest_timestamp_;
+    }
+  }
+  xSemaphoreGive(latest_jpeg_mutex_);
+  return ok;
+}
+
+uint32_t CameraAddon::getLatestFrameSequence() const {
+  if (!latest_jpeg_mutex_) {
+    return 0;
+  }
+  CameraAddon *self = const_cast<CameraAddon *>(this);
+  uint32_t seq = 0;
+  if (xSemaphoreTake(self->latest_jpeg_mutex_, 0) == pdTRUE) {
+    seq = latest_sequence_;
+    xSemaphoreGive(self->latest_jpeg_mutex_);
+  }
+  return seq;
+}
+
+esp_err_t CameraAddon::streamMjpegFromSharedLatest(httpd_req_t *req) {
+  esp_err_t res = httpd_resp_set_type(req, kStreamContentType);
+  if (res != ESP_OK) {
+    return res;
+  }
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char hdr_fps[16];
+  snprintf(hdr_fps, sizeof(hdr_fps), "%u", (unsigned)stream_max_fps_);
+  httpd_resp_set_hdr(req, "X-Framerate", hdr_fps);
+
+#if defined(LED_GPIO_NUM)
+  is_streaming_ = true;
+  enableLed(true);
+#endif
+
+  char part_buf[128];
+  static int64_t last_frame = 0;
+  if (!last_frame) {
+    last_frame = esp_timer_get_time();
+  }
+
+  mjpeg_next_deadline_us_ = esp_timer_get_time();
+
+  while (true) {
+    res = ESP_OK;
+    const uint8_t fps_cap =
+        stream_max_fps_ ? (stream_max_fps_ > 15 ? 15 : (stream_max_fps_ < 1 ? 1 : stream_max_fps_)) : 15;
+    const int64_t min_interval_us = 1000000 / fps_cap;
+
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us < mjpeg_next_deadline_us_) {
+      const int64_t wait_us = mjpeg_next_deadline_us_ - now_us;
+      vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
+      continue;
+    }
+
+    size_t jpg_buf_len = 0;
+    uint8_t *const jpg_buf = stream_tx_buf_;
+    struct timeval timestamp {};
+
+    if (xSemaphoreTake(latest_jpeg_mutex_, pdMS_TO_TICKS(500)) != pdTRUE) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (latest_jpeg_len_ == 0 || latest_jpeg_len_ > latest_jpeg_cap_) {
+      xSemaphoreGive(latest_jpeg_mutex_);
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    memcpy(stream_tx_buf_, latest_jpeg_buf_, latest_jpeg_len_);
+    jpg_buf_len = latest_jpeg_len_;
+    timestamp = latest_timestamp_;
+    xSemaphoreGive(latest_jpeg_mutex_);
+
+    res = httpd_resp_send_chunk(req, kStreamBoundary, strlen(kStreamBoundary));
+    if (res == ESP_OK) {
+      const size_t hlen =
+          snprintf(part_buf, sizeof(part_buf), kStreamPart, (unsigned)jpg_buf_len, (int)timestamp.tv_sec,
+                   (int)timestamp.tv_usec);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+    }
+    if (res == ESP_OK && jpg_buf_len > 0) {
+      res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_buf_len);
+    }
+    if (res != ESP_OK) {
+      log_e("MJPEG (buffer partilhado): envio falhou");
+      break;
+    }
+
+    mjpeg_next_deadline_us_ = esp_timer_get_time() + min_interval_us;
+
+    const int64_t fr_end = esp_timer_get_time();
+    int64_t frame_time = fr_end - last_frame;
+    last_frame = fr_end;
+    frame_time /= 1000;
+    const uint32_t avg_frame_time = (uint32_t)raFilterRun(&ra_filter_, (int)frame_time);
+    const float fps = frame_time > 0 ? 1000.0f / (float)frame_time : 0;
+    const float avg_fps = avg_frame_time > 0 ? 1000.0f / (float)avg_frame_time : 0;
+#if CAMERAADDON_MJPEG_TRACE
+    log_i("MJPG(sh): %uB %ums (%.1ffps), AVG: %ums (%.1ffps)", (uint32_t)jpg_buf_len, (uint32_t)frame_time, fps,
+          avg_frame_time, avg_fps);
+#else
+    (void)fps;
+    (void)avg_fps;
+#endif
+  }
+
+#if defined(LED_GPIO_NUM)
+  is_streaming_ = false;
+  enableLed(false);
+#endif
+
+  return res;
 }

@@ -160,9 +160,54 @@ class CameraAddon {
   bool captureAndNotify();
 
   /**
+   * Dono único da câmera: inicia tarefa FreeRTOS que faz esp_camera_fb_get() a ritmo fixo (até ~15 Hz).
+   * O /stream e copyLatestJpeg() deixam de capturar — só leem o último JPEG desta tarefa.
+   * Chamar depois de initCamera(). Não depende do loop() do Arduino.
+   */
+  bool startFrameService(uint32_t stack_words = 8192, UBaseType_t priority = 3);
+
+  /** Para a tarefa de captura e liberta buffers internos (chamado automaticamente no destrutor). */
+  void stopFrameService();
+
+  /** true se startFrameService() está ativo. */
+  bool isFrameServiceRunning() const { return frame_service_started_; }
+
+  /**
+   * FPS máximo de envio no MJPEG /stream (1–15). O handler não chama esp_camera_fb_get;
+   * envia cópias do último frame; se a rede for lenta, o FPS efetivo fica abaixo deste teto.
+   */
+  void setStreamMaxFps(uint8_t fps);
+
+  /**
+   * Intervalo mínimo entre chamadas ao sink auxiliar (LCD, ML, etc.), em ms.
+   * O sink corre na tarefa de captura, com cópia do JPEG (ponteiro só válido durante a chamada).
+   */
+  void setAuxJpegDeliverPeriodMs(uint32_t ms);
+
+  /**
+   * Sink opcional: recebe (jpeg, len, ctx) com cópia temporária; não guarde o ponteiro.
+   * nullptr desativa.
+   */
+  void setAuxJpegSink(void (*sink)(const uint8_t *jpeg, size_t len, void *ctx), void *ctx);
+
+  /**
+   * Cópia thread-safe do último JPEG capturado pela tarefa interna.
+   * @param timeout_ms tempo máximo de espera pelo mutex (0 = não bloqueia; use ~100–500 para bloquear).
+   * @return false se sem frame ainda, dst_cap insuficiente, ou timeout.
+   */
+  bool copyLatestJpeg(uint8_t *dst, size_t dst_cap, size_t *out_len, struct timeval *timestamp_out,
+                      uint32_t timeout_ms = 100);
+
+  /** Número de sequência monotónico do último frame (útil para detetar frame novo). */
+  uint32_t getLatestFrameSequence() const;
+
+  /**
    * Inicia o servidor MJPEG em http://<IP>:81/stream (mesma lógica que stream_handler).
    */
   bool startStream();
+
+  /** @deprecated Preferir setStreamMaxFps() com o serviço de frames ativo. */
+  void setStreamMinPeriodMs(uint32_t ms) { stream_min_period_ms_ = ms; }
 
   /** URL do stream MJPEG após WiFi ligado. */
   String getStreamURL() const;
@@ -180,6 +225,10 @@ class CameraAddon {
 
   static esp_err_t streamHandlerThunk(httpd_req_t *req);
   esp_err_t streamHandler(httpd_req_t *req);
+  esp_err_t streamMjpegFromSharedLatest(httpd_req_t *req);
+
+  static void captureWorkerThunk(void *arg);
+  void captureWorkerLoop();
 
   enum SensorDirty : uint32_t {
     kDirtyContrast = 1u << 0,
@@ -210,7 +259,25 @@ class CameraAddon {
   void markDirty(uint32_t bit);
 
   httpd_handle_t stream_httpd_;
+  uint32_t stream_min_period_ms_;
   void (*capture_cb_)(uint8_t *buf, size_t len);
+
+  bool frame_service_started_;
+  bool run_capture_worker_;
+  TaskHandle_t capture_task_handle_;
+  SemaphoreHandle_t latest_jpeg_mutex_;
+  uint8_t *latest_jpeg_buf_;
+  uint8_t *stream_tx_buf_;
+  size_t latest_jpeg_cap_;
+  size_t latest_jpeg_len_;
+  struct timeval latest_timestamp_;
+  uint32_t latest_sequence_;
+  int64_t mjpeg_next_deadline_us_;
+  uint8_t stream_max_fps_;
+  uint32_t aux_deliver_period_ms_;
+  uint32_t last_aux_deliver_ms_;
+  void (*aux_jpeg_sink_)(const uint8_t *jpeg, size_t len, void *ctx);
+  void *aux_jpeg_sink_ctx_;
 
   camera_fb_t *pending_fb_;
   uint8_t *pending_alloc_;
