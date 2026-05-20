@@ -18,6 +18,23 @@
 #include <Arduino_GFX_Library.h>
 #include <displayfk.h>
 #include <cstring>
+#include <Arduino.h>
+
+/* Potenciômetro: cursor em GPIO1, extremos em 3V3 e GND.
+ * LEDs 5V (2x 150R em paralelo no coletor) via BC548: base GPIO42, emissor GND. */
+constexpr int kPotPin = 1;
+constexpr int kLedPwmPin = 42;
+constexpr uint32_t kLedPwmHz = 5000;
+constexpr uint8_t kLedPwmBits = 8;
+constexpr uint32_t kPotReadMs = 20;
+/** Canal LEDC (evitar 7 se usar flash da câmera no mesmo core). */
+constexpr uint8_t kLedPwmChannel = 1;
+/** Abaixo disto (ADC 12 bit) força brilho 0 — evita ruído/piscar com pot no mínimo. */
+constexpr int kPotAdcDeadzone = 200;
+/** Duty PWM 1..N tratados como 0 (LED ainda não acende de forma estável). */
+constexpr uint32_t kLedDutyDeadzone = 5;
+constexpr int kPotAdcSamples = 8;
+constexpr float kPotFilterAlpha = 0.25f;
 
     /* Project setup:
     * MCU: ESP32S3
@@ -56,7 +73,8 @@ const bool isIPS = true; // Come display can use this as bigEndian flag
 void screen0();
 void loadWidgets();
 void initCamera();
-void rotate_image(uint16_t* src, uint16_t* dst, int width, int height, int angle) ;
+void initLedPwm();
+void updateLedsFromPot();
 
 static void aux_jpeg_to_lcd(const uint8_t *jpeg, size_t len, void * /*ctx*/);
 
@@ -81,9 +99,22 @@ static uint16_t live_pixels[iimagesW * iimagesH];
 /** Máscara 1 bit/pixel, opaco em todo o bitmap (como iimagesMask). */
 static uint8_t live_mask[(iimagesW * iimagesH) / 8];
 
+static float s_pot_adc_filtered = 0.0f;
+static bool s_pot_filter_ready = false;
+static uint32_t s_led_last_duty = UINT32_MAX;
+
+static int readPotAdcAveraged() {
+    int sum = 0;
+    for (int i = 0; i < kPotAdcSamples; ++i) {
+        sum += analogRead(kPotPin);
+    }
+    return sum / kPotAdcSamples;
+}
+
 void setup(){
 
     Serial.begin(115200);
+    initLedPwm();
     // Start SPI object for display
     spi_shared.begin(DISP_SCLK, DISP_MISO, DISP_MOSI);
     bus = new Arduino_HWSPI(DISP_DC, DISP_CS, DISP_SCLK, DISP_MOSI, DISP_MISO, &spi_shared);
@@ -104,12 +135,53 @@ void setup(){
 }
 
 void loop(){
-    /* A câmera e o stream são geridos pela biblioteca; o loop pode ficar vazio ou tratar outra lógica.
-       Exemplo de frame esporádico noutra tarefa:
-         uint8_t buf[8000]; size_t n;
-         if (camera.copyLatestJpeg(buf, sizeof(buf), &n, nullptr, 50)) { ... }
-    */
-    delay(200);
+    updateLedsFromPot();
+    delay(kPotReadMs);
+}
+
+void initLedPwm() {
+    analogReadResolution(12);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 4, 0)
+    analogSetPinAttenuation(kPotPin, ADC_11db);
+#endif
+    pinMode(kPotPin, INPUT);
+
+    const uint32_t maxDuty = (1u << kLedPwmBits) - 1u;
+    ledcSetup(kLedPwmChannel, kLedPwmHz, kLedPwmBits);
+    ledcAttachPin(kLedPwmPin, kLedPwmChannel);
+    ledcWrite(kLedPwmChannel, 0);
+    Serial.printf("LED PWM: GPIO%d, %u Hz, duty 0..%u (pot GPIO%d)\n", kLedPwmPin, kLedPwmHz, maxDuty,
+                  kPotPin);
+}
+
+void updateLedsFromPot() {
+    const int raw = readPotAdcAveraged();
+
+    if (!s_pot_filter_ready) {
+        s_pot_adc_filtered = static_cast<float>(raw);
+        s_pot_filter_ready = true;
+    } else {
+        s_pot_adc_filtered += kPotFilterAlpha * (static_cast<float>(raw) - s_pot_adc_filtered);
+    }
+
+    int adc = static_cast<int>(s_pot_adc_filtered + 0.5f);
+    if (adc <= kPotAdcDeadzone) {
+        adc = 0;
+    } else {
+        adc = map(adc, kPotAdcDeadzone, 4095, 0, 4095);
+    }
+
+    const uint32_t maxDuty = (1u << kLedPwmBits) - 1u;
+    uint32_t duty = static_cast<uint32_t>(map(adc, 0, 4095, 0, static_cast<int>(maxDuty)));
+    if (duty <= kLedDutyDeadzone) {
+        duty = 0;
+    }
+
+    if (duty == s_led_last_duty) {
+        return;
+    }
+    s_led_last_duty = duty;
+    ledcWrite(kLedPwmChannel, duty);
 }
 
 void screen0(){

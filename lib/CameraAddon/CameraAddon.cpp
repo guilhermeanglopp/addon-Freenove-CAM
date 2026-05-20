@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -52,6 +53,9 @@ CameraAddon::CameraAddon()
       last_aux_deliver_ms_(0),
       aux_jpeg_sink_(nullptr),
       aux_jpeg_sink_ctx_(nullptr),
+      aux_jpeg_queue_(nullptr),
+      run_aux_deliver_task_(false),
+      aux_deliver_task_handle_(nullptr),
       pending_fb_(nullptr),
       pending_alloc_(nullptr),
       quality_user_set_(false),
@@ -886,10 +890,48 @@ bool CameraAddon::startStream() {
 
 namespace {
 constexpr size_t kMaxJpegBufferBytes = 384 * 1024;
-}
+constexpr uint32_t kAuxDeliverStackWords = 12288;
+constexpr UBaseType_t kAuxDeliverPriority = 2;
+constexpr UBaseType_t kAuxQueueDepth = 1;
+}  // namespace
 
 void CameraAddon::captureWorkerThunk(void *arg) {
   static_cast<CameraAddon *>(arg)->captureWorkerLoop();
+}
+
+void CameraAddon::auxDeliverThunk(void *arg) {
+  static_cast<CameraAddon *>(arg)->auxDeliverLoop();
+}
+
+void CameraAddon::drainAuxJpegQueue() {
+  if (!aux_jpeg_queue_) {
+    return;
+  }
+  AuxJpegMsg msg{};
+  while (xQueueReceive(aux_jpeg_queue_, &msg, 0) == pdTRUE) {
+    if (msg.data) {
+      free(msg.data);
+    }
+  }
+}
+
+void CameraAddon::auxDeliverLoop() {
+  while (run_aux_deliver_task_) {
+    AuxJpegMsg msg{};
+    if (xQueueReceive(aux_jpeg_queue_, &msg, pdMS_TO_TICKS(200)) != pdTRUE) {
+      continue;
+    }
+    if (!msg.data) {
+      continue;
+    }
+    void (*sink)(const uint8_t *, size_t, void *) = aux_jpeg_sink_;
+    if (sink && msg.len > 0) {
+      sink(msg.data, msg.len, aux_jpeg_sink_ctx_);
+    }
+    free(msg.data);
+  }
+  aux_deliver_task_handle_ = nullptr;
+  vTaskDelete(nullptr);
 }
 
 void CameraAddon::captureWorkerLoop() {
@@ -939,8 +981,7 @@ void CameraAddon::captureWorkerLoop() {
     xSemaphoreGive(latest_jpeg_mutex_);
     esp_camera_fb_return(fb);
 
-    void (*sink)(const uint8_t *, size_t, void *) = aux_jpeg_sink_;
-    if (sink && aux_deliver_period_ms_ > 0) {
+    if (aux_jpeg_sink_ && aux_jpeg_queue_ && aux_deliver_period_ms_ > 0) {
       const uint32_t now_ms = millis();
       if (now_ms - last_aux_deliver_ms_ >= aux_deliver_period_ms_) {
         last_aux_deliver_ms_ = now_ms;
@@ -948,12 +989,20 @@ void CameraAddon::captureWorkerLoop() {
         if (!dup) {
           continue;
         }
+        bool copied = false;
         if (xSemaphoreTake(latest_jpeg_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
           memcpy(dup, latest_jpeg_buf_, jpeg_len);
+          copied = true;
           xSemaphoreGive(latest_jpeg_mutex_);
-          sink(dup, jpeg_len, aux_jpeg_sink_ctx_);
         }
-        free(dup);
+        if (!copied) {
+          free(dup);
+          continue;
+        }
+        const AuxJpegMsg msg = {dup, jpeg_len};
+        if (xQueueSend(aux_jpeg_queue_, &msg, 0) != pdTRUE) {
+          free(dup);
+        }
       }
     }
   }
@@ -999,11 +1048,45 @@ bool CameraAddon::startFrameService(uint32_t stack_words, UBaseType_t priority) 
   latest_jpeg_len_ = 0;
   latest_sequence_ = 0;
   last_aux_deliver_ms_ = millis();
+
+  aux_jpeg_queue_ = xQueueCreate(kAuxQueueDepth, sizeof(AuxJpegMsg));
+  if (!aux_jpeg_queue_) {
+    free(latest_jpeg_buf_);
+    free(stream_tx_buf_);
+    latest_jpeg_buf_ = nullptr;
+    stream_tx_buf_ = nullptr;
+    vSemaphoreDelete(latest_jpeg_mutex_);
+    latest_jpeg_mutex_ = nullptr;
+    return false;
+  }
+
+  run_aux_deliver_task_ = true;
+  if (xTaskCreatePinnedToCore(auxDeliverThunk, "camAux", kAuxDeliverStackWords, this, kAuxDeliverPriority,
+                              &aux_deliver_task_handle_, 0) != pdPASS) {
+    run_aux_deliver_task_ = false;
+    vQueueDelete(aux_jpeg_queue_);
+    aux_jpeg_queue_ = nullptr;
+    free(latest_jpeg_buf_);
+    free(stream_tx_buf_);
+    latest_jpeg_buf_ = nullptr;
+    stream_tx_buf_ = nullptr;
+    vSemaphoreDelete(latest_jpeg_mutex_);
+    latest_jpeg_mutex_ = nullptr;
+    return false;
+  }
+
   run_capture_worker_ = true;
 
   if (xTaskCreatePinnedToCore(captureWorkerThunk, "camFrame", stack_words, this, priority, &capture_task_handle_,
                               1) != pdPASS) {
     run_capture_worker_ = false;
+    run_aux_deliver_task_ = false;
+    for (int i = 0; i < 100 && aux_deliver_task_handle_ != nullptr; ++i) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    drainAuxJpegQueue();
+    vQueueDelete(aux_jpeg_queue_);
+    aux_jpeg_queue_ = nullptr;
     free(latest_jpeg_buf_);
     free(stream_tx_buf_);
     latest_jpeg_buf_ = nullptr;
@@ -1014,7 +1097,8 @@ bool CameraAddon::startFrameService(uint32_t stack_words, UBaseType_t priority) 
   }
 
   frame_service_started_ = true;
-  log_i("Serviço de frame único ativo (captura ~15 Hz, core 1).");
+  log_i("Serviço de frame: camFrame core1 stack=%u; camAux core0 stack=%u (LCD).",
+        (unsigned)stack_words, (unsigned)kAuxDeliverStackWords);
   return true;
 }
 
@@ -1024,6 +1108,17 @@ void CameraAddon::stopFrameService() {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   capture_task_handle_ = nullptr;
+
+  run_aux_deliver_task_ = false;
+  for (int i = 0; i < 200 && aux_deliver_task_handle_ != nullptr; ++i) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  aux_deliver_task_handle_ = nullptr;
+  drainAuxJpegQueue();
+  if (aux_jpeg_queue_) {
+    vQueueDelete(aux_jpeg_queue_);
+    aux_jpeg_queue_ = nullptr;
+  }
 
   if (latest_jpeg_mutex_) {
     vSemaphoreDelete(latest_jpeg_mutex_);

@@ -164,6 +164,10 @@ class CameraAddon {
    * O /stream e copyLatestJpeg() deixam de capturar — só leem o último JPEG desta tarefa.
    * Chamar depois de initCamera(). Não depende do loop() do Arduino.
    */
+  /**
+   * @param stack_words stack da tarefa de captura (só esp_camera_fb_get + cópia; default 8192).
+   * O sink LCD corre noutra tarefa com stack maior para não sobrecarregar cam_task.
+   */
   bool startFrameService(uint32_t stack_words = 8192, UBaseType_t priority = 3);
 
   /** Para a tarefa de captura e liberta buffers internos (chamado automaticamente no destrutor). */
@@ -230,6 +234,10 @@ class CameraAddon {
   static void captureWorkerThunk(void *arg);
   void captureWorkerLoop();
 
+  static void auxDeliverThunk(void *arg);
+  void auxDeliverLoop();
+  void drainAuxJpegQueue();
+
   enum SensorDirty : uint32_t {
     kDirtyContrast = 1u << 0,
     kDirtyGainCeiling = 1u << 1,
@@ -278,6 +286,15 @@ class CameraAddon {
   uint32_t last_aux_deliver_ms_;
   void (*aux_jpeg_sink_)(const uint8_t *jpeg, size_t len, void *ctx);
   void *aux_jpeg_sink_ctx_;
+
+  struct AuxJpegMsg {
+    uint8_t *data;
+    size_t len;
+  };
+
+  QueueHandle_t aux_jpeg_queue_;
+  bool run_aux_deliver_task_;
+  TaskHandle_t aux_deliver_task_handle_;
 
   camera_fb_t *pending_fb_;
   uint8_t *pending_alloc_;
